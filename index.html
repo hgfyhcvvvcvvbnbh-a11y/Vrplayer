@@ -68,13 +68,14 @@
     flex: 1 1 auto; min-width: 0; margin-right: 12px;
     white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
   }
-  .nav-icons { display: flex; gap: 16px; align-items: center; flex: 0 0 auto; }
+  .nav-icons { display: flex; gap: 10px; align-items: center; flex: 0 0 auto; }
   .nav-icon {
     font-size: 17px; cursor: pointer; width: 30px; height: 30px;
     display: flex; align-items: center; justify-content: center;
     background: rgba(255,255,255,0.12); border-radius: 50%;
   }
   .nav-icon.active { background: linear-gradient(135deg, #833ab4, #fd1d1d); }
+  .nav-icon.off { opacity: 0.4; }
 
   .counter {
     position: absolute; top: 54px; left: 14px; z-index: 5;
@@ -236,7 +237,8 @@
       <div class="nav-icon" id="zoomInBtn" title="Zoom in">+</div>
       <div class="nav-icon" id="projToggle" title="Sphere / Flat">🌐</div>
       <div class="nav-icon" id="eyeToggle" title="Stereo eye (for SBS 3D video)">👁</div>
-      <div class="nav-icon" id="modeToggle" title="Look mode">🧭</div>
+      <div class="nav-icon" id="modeToggle" title="Motion sensor on/off">🧭</div>
+      <div class="nav-icon" id="touchToggle" title="Finger drag on/off">👆</div>
       <div class="nav-icon" id="fovToggle" title="180 / 360">360</div>
       <div class="nav-icon" id="fsToggle" title="Fullscreen">⛶</div>
       <div class="nav-icon" id="muteToggle" title="Mute">🔇</div>
@@ -333,7 +335,17 @@ video.playsInline = true;
 video.muted = true;
 video.loop = true;
 
-let lookMode = 'gyro';      // 'gyro' or 'touch'
+let lookMode = 'gyro';      // sensor state: 'gyro' = sensor ON, 'touch' = sensor OFF
+let touchOn = true;         // finger drag ON/OFF (independent of the sensor)
+function updateModeButtons() {
+  const m = document.getElementById('modeToggle');
+  const t = document.getElementById('touchToggle');
+  m.textContent = '🧭'; t.textContent = '👆';
+  m.classList.toggle('active', lookMode === 'gyro');
+  m.classList.toggle('off', lookMode !== 'gyro');
+  t.classList.toggle('active', touchOn);
+  t.classList.toggle('off', !touchOn);
+}
 let is180 = false;
 let lon = 0, lat = 0;
 let baseFov = 90;
@@ -347,6 +359,8 @@ let stereoMode = 'full'; // 'full' | 'left' | 'right' - for side-by-side stereo 
 let uvScale = [1, 1], uvOffset = [0, 0];
 
 let camQuat = { x: 0, y: 0, z: 0, w: 1 };
+let gyroYaw = 0, gyroPitch = 0;   // finger-drag offset applied on top of the sensor
+let startGyroYaw = 0, startGyroPitch = 0;
 let deviceOrientationActive = false;
 let screenOrientAngle = 0;
 
@@ -594,7 +608,11 @@ function animate() {
     view = mat4LookAt([0, 0, 0], target, [0, 1, 0]);
   } else {
     // sphere+gyro mode: camQuat is set directly by the deviceorientation handler
-    view = mat4Transpose(quatToMat4(camQuat));
+    gyroPitch = Math.max(-85, Math.min(85, gyroPitch));
+    const qYaw = quatFromAxisAngle([0, 1, 0], gyroYaw * DEG2RAD);
+    const qPitch = quatFromAxisAngle([1, 0, 0], gyroPitch * DEG2RAD);
+    const qFinal = quatMultiply(quatMultiply(qYaw, camQuat), qPitch);
+    view = mat4Transpose(quatToMat4(qFinal));
   }
 
   const aspect = canvas.width / canvas.height;
@@ -660,8 +678,7 @@ function enableGyro() {
   window.addEventListener('deviceorientation', onDeviceOrientation);
   deviceOrientationActive = true;
   lookMode = 'gyro';
-  document.getElementById('modeToggle').textContent = '🧭';
-  document.getElementById('modeToggle').classList.add('active');
+  updateModeButtons();
 }
 
 function disableGyro() {
@@ -676,13 +693,13 @@ function maybeShowGyroGate() {
   if (needsPermission) {
     document.getElementById('gyroGate').classList.add('show');
     lookMode = 'touch';
-    document.getElementById('modeToggle').textContent = '👆';
+    updateModeButtons();
   } else if (window.DeviceOrientationEvent) {
     enableGyro();
   } else {
     lookMode = 'touch';
-    document.getElementById('modeToggle').textContent = '👆';
-    document.getElementById('modeToggle').style.opacity = '0.4';
+    updateModeButtons();
+    document.getElementById('modeToggle').style.display = 'none';
   }
 
   document.getElementById('gyroEnableBtn').addEventListener('click', async () => {
@@ -764,6 +781,8 @@ function onPointerDown(e) {
   curClientY = e.clientY;
   startLon = lon;
   startLat = lat;
+  startGyroYaw = gyroYaw;
+  startGyroPitch = gyroPitch;
 
   hiddenScrubActive = false;
   clearTimeout(longPressTimer);
@@ -791,9 +810,13 @@ function onPointerMove(e) {
     scrubToClientX(e.clientX);
     return;
   }
-  if (projectionMode === 'sphere' && lookMode === 'touch') {
+  if (touchOn && projectionMode === 'sphere' && lookMode === 'touch') {
     lon = startLon - dx * 0.18;
     lat = startLat + dy * 0.18;
+  } else if (touchOn && projectionMode === 'sphere' && lookMode === 'gyro') {
+    // sensor + finger drag together
+    gyroYaw = startGyroYaw + dx * 0.18;
+    gyroPitch = startGyroPitch + dy * 0.18;
   }
 }
 
@@ -1096,21 +1119,24 @@ function setupTopNav() {
     btn.classList.toggle('active', stereoMode !== 'full');
   });
 
+  // Sensor ON/OFF
   document.getElementById('modeToggle').addEventListener('click', () => {
     if (lookMode === 'gyro') {
-      lookMode = 'touch';
+      lookMode = 'touch';          // sensor OFF
       lon = 0; lat = 0;
-      document.getElementById('modeToggle').textContent = '👆';
-      document.getElementById('modeToggle').classList.remove('active');
+    } else if (deviceOrientationActive) {
+      lookMode = 'gyro';           // sensor ON
+      gyroYaw = 0; gyroPitch = 0;
     } else {
-      if (deviceOrientationActive) {
-        lookMode = 'gyro';
-        document.getElementById('modeToggle').textContent = '🧭';
-        document.getElementById('modeToggle').classList.add('active');
-      } else {
-        document.getElementById('gyroGate').classList.add('show');
-      }
+      document.getElementById('gyroGate').classList.add('show');
     }
+    updateModeButtons();
+  });
+
+  // Finger drag ON/OFF
+  document.getElementById('touchToggle').addEventListener('click', () => {
+    touchOn = !touchOn;
+    updateModeButtons();
   });
 
   document.getElementById('fovToggle').addEventListener('click', () => {
@@ -1152,6 +1178,7 @@ function setProjectionMode(mode) {
 
   // gyro/touch look mode only makes sense in free-look sphere mode
   document.getElementById('modeToggle').style.display = flat ? 'none' : 'flex';
+  document.getElementById('touchToggle').style.display = flat ? 'none' : 'flex';
 }
 
 /* ---------- Playlist ---------- */
@@ -1198,7 +1225,7 @@ function loadIndex(idx) {
   document.getElementById('prevBtn').disabled = idx === 0;
   document.getElementById('nextBtn').disabled = idx === files.length - 1;
   // reset view/zoom for the new video
-  lon = 0; lat = 0; fov = baseFov;
+  lon = 0; lat = 0; gyroYaw = 0; gyroPitch = 0; fov = baseFov;
   if (typeof showControls === 'function') showControls();
 }
 
