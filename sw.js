@@ -1,4 +1,4 @@
-const CACHE = 'vr-player-v3';
+const CACHE = 'vr-player-v11';
 const FILES = ['./', './index.html', './manifest.json', './icon.svg'];
 
 self.addEventListener('install', (e) => {

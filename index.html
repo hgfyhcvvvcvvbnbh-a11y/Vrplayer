@@ -91,6 +91,8 @@
     pointer-events: none; max-width: 70%;
   }
   .video-name-badge.error { color: #ff6b6b; }
+  .video-name-badge { opacity: 0; }          /* the title already shows in the top bar, which hides on its own */
+  .video-name-badge.error { opacity: 1; }    /* but keep it visible if the video fails to play */
 
   .error-detail {
     position: absolute; top: 30px; left: 14px; right: 14px; z-index: 7;
@@ -100,6 +102,14 @@
     opacity: 0; transition: opacity 0.2s;
   }
   .error-detail.show { opacity: 1; }
+
+  #diag {
+    position: absolute; left: 14px; top: 76px; right: 14px; z-index: 7;
+    font-size: 11px; font-weight: 600; color: #9fd3ff;
+    text-shadow: 0 1px 3px rgba(0,0,0,0.9);
+    pointer-events: none; opacity: 0; transition: opacity 0.3s;
+  }
+  #diag.show { opacity: 1; }
 
   .jump-badge {
     position: absolute; top: 54px; left: 50%; transform: translateX(-50%); z-index: 5;
@@ -115,7 +125,8 @@
     z-index: 4; opacity: 0; pointer-events: none; transition: opacity 0.15s;
   }
   .play-icon svg { width: 60px; height: 60px; filter: drop-shadow(0 2px 8px rgba(0,0,0,0.6)); }
-  #viewer.paused .play-icon { opacity: 1; }
+  /* big centre play symbol removed - the play/pause button in the bottom bar is enough */
+  .play-icon { display: none; }
 
   .zoom-badge {
     position: absolute; top: 54px; right: 14px; z-index: 5;
@@ -228,15 +239,13 @@
   <div id="gesture-layer"></div>
   <div class="video-name-badge" id="videoNameBadge"></div>
   <div class="error-detail" id="errorDetail"></div>
+  <div id="diag"></div>
   <div class="jump-badge" id="jumpBadge"></div>
 
   <div class="top-nav">
     <div class="nav-title" id="videoTitle">VR Player</div>
     <div class="nav-icons">
-      <div class="nav-icon" id="zoomOutBtn" title="Zoom out">−</div>
-      <div class="nav-icon" id="zoomInBtn" title="Zoom in">+</div>
-      <div class="nav-icon" id="projToggle" title="Sphere / Flat">🌐</div>
-      <div class="nav-icon" id="eyeToggle" title="Stereo eye (for SBS 3D video)">👁</div>
+      <div class="nav-icon" id="projToggle" title="Sphere / Tiny world">🌐</div>
       <div class="nav-icon" id="modeToggle" title="Motion sensor on/off">🧭</div>
       <div class="nav-icon" id="touchToggle" title="Finger drag on/off">👆</div>
       <div class="nav-icon" id="fovToggle" title="180 / 360">360</div>
@@ -328,6 +337,8 @@ document.getElementById('filesInput').addEventListener('change', e => loadVideos
 
 const DEG2RAD = Math.PI / 180;
 
+let maxTex = 4096, lastErr = '', dbgFrames = 0, diagUntil = 0;
+let scaleCanvas = null, scaleCtx = null;
 let gl, program, posBuffer, uvBuffer, indexBuffer, indexCount, videoTex;
 let aPositionLoc, aUVLoc, uViewProjLoc, uTexLoc, uUVScaleLoc, uUVOffsetLoc;
 let video = document.createElement('video');
@@ -350,10 +361,19 @@ let is180 = false;
 let lon = 0, lat = 0;
 let baseFov = 90;
 let fov = 90;
-const MIN_FOV = 25, MAX_FOV = 130;
+const MIN_FOV = 10, MAX_FOV = 150;   // zoom range: ~900% in  ...  ~60% out
 
-let projectionMode = 'sphere'; // 'sphere' (free-look) or 'flat' (locked forward view, dewarped)
-let preFlatFov = 90;
+let projectionMode = 'sphere'; // 'sphere' | 'planet'
+let planetTilt = 90, startPlanetTilt = 90;   // 90 = look forward (like a fisheye ball), 0 = look straight down (classic little planet)
+const DRAG_GAIN = 1.2;  // 1.0 = picture sticks exactly to the finger; a little above feels livelier
+function dragSensSphere() { return DRAG_GAIN * fov / window.innerHeight; }
+function dragSensPlanet() {
+  const zoom = 1.16 * fov / 90;                                   // same zoom the shader uses
+  const halfShort = Math.min(window.innerWidth, window.innerHeight) / 2;
+  return DRAG_GAIN * (2 * zoom * 57.2958) / halfShort;            // degrees per pixel at the centre of the ball
+}
+function isFreeLook() { return projectionMode === 'sphere'; }
+let prePlanetFov = 90;
 
 let stereoMode = 'full'; // 'full' | 'left' | 'right' - for side-by-side stereo (SBS) VR footage
 let uvScale = [1, 1], uvOffset = [0, 0];
@@ -384,6 +404,57 @@ const FRAGMENT_SRC = `
     gl_FragColor = texture2D(uTex, vUV * uUVScale + uUVOffset);
   }
 `;
+
+const PLANET_VS = `
+  attribute vec2 aPos;
+  varying vec2 vP;
+  void main() { vP = aPos; gl_Position = vec4(aPos, 0.0, 1.0); }
+`;
+const PLANET_FS = `
+  #ifdef GL_FRAGMENT_PRECISION_HIGH
+  precision highp float;
+  #else
+  precision mediump float;
+  #endif
+  varying vec2 vP;
+  uniform sampler2D uTex;
+  uniform vec2 uUVScale;
+  uniform vec2 uUVOffset;
+  uniform float uAspect;
+  uniform float uZoom;
+  uniform float uYaw;
+  uniform float uTilt;
+  uniform mat3 uRot;
+  uniform float uUseRot;
+  uniform float uIs180;
+  void main() {
+    // fit the circle to the SHORT side of the screen (works in portrait and landscape)
+    vec2 q = (uAspect >= 1.0) ? vec2(vP.x * uAspect, vP.y) : vec2(vP.x, vP.y / uAspect);
+    vec2 p = q * uZoom;
+    float r2 = dot(p, p);
+    // stereographic projection: centre = looking forward, circle edge = 90 deg away, outside = what is behind you
+    vec3 d = vec3(1.0 - r2, 2.0 * p.y, 2.0 * p.x) / (1.0 + r2);   // x forward, y up, z right
+    if (uUseRot > 0.5) {
+      d = uRot * vec3(d.z, d.y, -d.x);                             // motion sensor: ball follows the phone
+    } else {
+      float cb = cos(uTilt), sb = sin(uTilt);
+      d = vec3(cb * d.x + sb * d.y, -sb * d.x + cb * d.y, d.z);   // tilt toward the ground
+      float c = cos(uYaw), s = sin(uYaw);
+      d = vec3(c * d.x - s * d.z, d.y, s * d.x + c * d.z);
+    }
+    float phi = atan(d.z, d.x);
+    float u;
+    if (uIs180 > 0.5) {
+      u = (phi + 1.5707963) / 3.1415927;
+      if (u < 0.0 || u > 1.0) { gl_FragColor = vec4(0.0, 0.0, 0.0, 1.0); return; }
+    } else {
+      u = fract(phi / 6.2831853);
+    }
+    float v = asin(clamp(d.y, -1.0, 1.0)) / 3.1415927 + 0.5;
+    gl_FragColor = texture2D(uTex, vec2(u, v) * uUVScale + uUVOffset);
+  }
+`;
+let planetProg, planetQuad, planetLoc = {};
 
 function compileShader(gl, type, src) {
   const s = gl.createShader(type);
@@ -483,6 +554,7 @@ const Q1_MINUS90_X = { x: -Math.SQRT1_2, y: 0, z: 0, w: Math.SQRT1_2 };
 function initViewer() {
   gl = canvas.getContext('webgl') || canvas.getContext('experimental-webgl');
   if (!gl) { alert('WebGL is not supported on this device/browser.'); return; }
+  maxTex = gl.getParameter(gl.MAX_TEXTURE_SIZE) || 4096;
 
   program = createProgram(gl, VERTEX_SRC, FRAGMENT_SRC);
   aPositionLoc = gl.getAttribLocation(program, 'aPosition');
@@ -491,6 +563,24 @@ function initViewer() {
   uTexLoc = gl.getUniformLocation(program, 'uTex');
   uUVScaleLoc = gl.getUniformLocation(program, 'uUVScale');
   uUVOffsetLoc = gl.getUniformLocation(program, 'uUVOffset');
+
+  planetProg = createProgram(gl, PLANET_VS, PLANET_FS);
+  planetLoc = {
+    pos: gl.getAttribLocation(planetProg, 'aPos'),
+    tex: gl.getUniformLocation(planetProg, 'uTex'),
+    scale: gl.getUniformLocation(planetProg, 'uUVScale'),
+    offset: gl.getUniformLocation(planetProg, 'uUVOffset'),
+    aspect: gl.getUniformLocation(planetProg, 'uAspect'),
+    zoom: gl.getUniformLocation(planetProg, 'uZoom'),
+    yaw: gl.getUniformLocation(planetProg, 'uYaw'),
+    tilt: gl.getUniformLocation(planetProg, 'uTilt'),
+    rot: gl.getUniformLocation(planetProg, 'uRot'),
+    useRot: gl.getUniformLocation(planetProg, 'uUseRot'),
+    is180: gl.getUniformLocation(planetProg, 'uIs180')
+  };
+  planetQuad = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, planetQuad);
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1, 1,-1, -1,1, 1,1]), gl.STATIC_DRAW);
 
   posBuffer = gl.createBuffer();
   uvBuffer = gl.createBuffer();
@@ -519,6 +609,7 @@ function initViewer() {
   setupTopNav();
   maybeShowGyroGate();
   setupAutoHideUI();
+  setInterval(updateDiag, 700);
 }
 
 /* ---------- Auto-hide controls after inactivity, so it's just the video ---------- */
@@ -579,6 +670,77 @@ function buildSphere() {
   indexCount = indices.length;
 }
 
+function rebuildGeometry() {
+  buildSphere();
+}
+
+function uploadVideoFrame() {
+  if (video.readyState < video.HAVE_CURRENT_DATA || !video.videoWidth) return;
+  gl.bindTexture(gl.TEXTURE_2D, videoTex);
+  let src = video;
+  const w = video.videoWidth, h = video.videoHeight;
+  if (w > maxTex || h > maxTex) {
+    // video is larger than this phone's GPU texture limit -> shrink it first, otherwise the screen stays black
+    const k = Math.min(maxTex / w, maxTex / h);
+    const tw = Math.max(2, Math.floor(w * k)), th = Math.max(2, Math.floor(h * k));
+    if (!scaleCanvas) { scaleCanvas = document.createElement('canvas'); scaleCtx = scaleCanvas.getContext('2d'); }
+    if (scaleCanvas.width !== tw || scaleCanvas.height !== th) { scaleCanvas.width = tw; scaleCanvas.height = th; }
+    scaleCtx.drawImage(video, 0, 0, tw, th);
+    src = scaleCanvas;
+  }
+  try {
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, src);
+  } catch (e) { lastErr = 'Texture upload failed: ' + e.message; }
+  if (dbgFrames++ < 40) {
+    const er = gl.getError();
+    if (er) lastErr = 'WebGL error ' + er + ' while uploading ' + w + '\u00d7' + h + ' video';
+  }
+}
+
+function updateDiag() {
+  const d = document.getElementById('diag');
+  let msg = '';
+  const w = video.videoWidth, h = video.videoHeight;
+  if (video.readyState >= 1 && !w) msg = '\u26a0 Sound only: this phone cannot decode the video track (H.265/HEVC?). Convert it to H.264 MP4.';
+  else if (lastErr) msg = '\u26a0 ' + lastErr;
+  else if (w) msg = w + '\u00d7' + h + (w > maxTex || h > maxTex ? ' (shrunk to fit GPU limit ' + maxTex + ')' : '');
+  d.textContent = msg;
+  d.classList.toggle('show', msg.charAt(0) === '\u26a0' || Date.now() < diagUntil);
+}
+
+function drawPlanet() {
+  uploadVideoFrame();
+  gl.viewport(0, 0, canvas.width, canvas.height);
+  gl.clearColor(0, 0, 0, 1);
+  gl.clear(gl.COLOR_BUFFER_BIT);
+  gl.useProgram(planetProg);
+  gl.uniform1f(planetLoc.aspect, canvas.width / canvas.height);
+  gl.uniform1f(planetLoc.zoom, 1.16 * fov / 90);
+  gl.uniform1f(planetLoc.yaw, lon * DEG2RAD);
+  gl.uniform1f(planetLoc.tilt, (90 - planetTilt) * DEG2RAD);
+  const useRot = (lookMode === 'gyro' && deviceOrientationActive) ? 1 : 0;
+  gl.uniform1f(planetLoc.useRot, useRot);
+  if (useRot) {
+    gyroPitch = Math.max(-85, Math.min(85, gyroPitch));
+    const qYaw = quatFromAxisAngle([0, 1, 0], gyroYaw * DEG2RAD);
+    const qPitch = quatFromAxisAngle([1, 0, 0], gyroPitch * DEG2RAD);
+    const R = quatToMat4(quatMultiply(quatMultiply(qYaw, camQuat), qPitch));
+    gl.uniformMatrix3fv(planetLoc.rot, false, new Float32Array([R[0],R[1],R[2], R[4],R[5],R[6], R[8],R[9],R[10]]));
+  }
+  gl.uniform1f(planetLoc.is180, is180 ? 1 : 0);
+  gl.uniform2f(planetLoc.scale, uvScale[0], uvScale[1]);
+  gl.uniform2f(planetLoc.offset, uvOffset[0], uvOffset[1]);
+  gl.activeTexture(gl.TEXTURE0);
+  gl.bindTexture(gl.TEXTURE_2D, videoTex);
+  gl.uniform1i(planetLoc.tex, 0);
+  gl.disableVertexAttribArray(aUVLoc);
+  gl.bindBuffer(gl.ARRAY_BUFFER, planetQuad);
+  gl.enableVertexAttribArray(planetLoc.pos);
+  gl.vertexAttribPointer(planetLoc.pos, 2, gl.FLOAT, false, 0, 0);
+  gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+  gl.disableVertexAttribArray(planetLoc.pos);
+}
+
 function applyStereoCrop() {
   if (stereoMode === 'left') { uvScale = [0.5, 1]; uvOffset = [0, 0]; }
   else if (stereoMode === 'right') { uvScale = [0.5, 1]; uvOffset = [0.5, 0]; }
@@ -595,12 +757,10 @@ function animate() {
   requestAnimationFrame(animate);
   if (!gl) return;
 
+  if (projectionMode === 'planet') { drawPlanet(); return; }
+
   let view;
-  if (projectionMode === 'flat') {
-    // locked forward view - this is what actually removes the fisheye curve:
-    // viewing a portion of the sphere through a normal perspective camera
-    view = mat4LookAt([0, 0, 0], [500, 0, 0], [0, 1, 0]);
-  } else if (lookMode === 'touch') {
+  if (lookMode === 'touch') {
     lat = Math.max(-85, Math.min(85, lat));
     const phi = (90 - lat) * DEG2RAD;
     const theta = lon * DEG2RAD;
@@ -619,10 +779,7 @@ function animate() {
   const proj = mat4Perspective(fov * DEG2RAD, aspect, 1, 1100);
   const viewProj = mat4Multiply(proj, view);
 
-  if (video.readyState >= video.HAVE_CURRENT_DATA) {
-    gl.bindTexture(gl.TEXTURE_2D, videoTex);
-    try { gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, video); } catch (e) {}
-  }
+  uploadVideoFrame();
 
   gl.viewport(0, 0, canvas.width, canvas.height);
   gl.clearColor(0, 0, 0, 1);
@@ -659,7 +816,6 @@ function setCameraQuaternionFromDeviceOrientation(alpha, beta, gamma, orient) {
 
 function onDeviceOrientation(e) {
   if (e.alpha === null) return;
-  if (projectionMode !== 'sphere') return;
   const orient = (screenOrientAngle || 0) * DEG2RAD;
   setCameraQuaternionFromDeviceOrientation(e.alpha, e.beta, e.gamma, orient);
 }
@@ -783,6 +939,7 @@ function onPointerDown(e) {
   startLat = lat;
   startGyroYaw = gyroYaw;
   startGyroPitch = gyroPitch;
+  startPlanetTilt = planetTilt;
 
   hiddenScrubActive = false;
   clearTimeout(longPressTimer);
@@ -810,14 +967,25 @@ function onPointerMove(e) {
     scrubToClientX(e.clientX);
     return;
   }
-  if (touchOn && projectionMode === 'sphere' && lookMode === 'touch') {
-    lon = startLon - dx * 0.18;
-    lat = startLat + dy * 0.18;
-  } else if (touchOn && projectionMode === 'sphere' && lookMode === 'gyro') {
-    // sensor + finger drag together
-    gyroYaw = startGyroYaw + dx * 0.18;
-    gyroPitch = startGyroPitch + dy * 0.18;
+  // Same rule in every mode: the picture follows your finger.
+  // Speed scales with zoom, so zoomed-in dragging is slower and precise.
+  if (touchOn) {
+    const planet = projectionMode === 'planet';
+    const k = planet ? dragSensPlanet() : dragSensSphere();
+    if (lookMode === 'gyro') {
+      // sensor + finger drag together
+      gyroYaw = startGyroYaw + dx * k;
+      gyroPitch = startGyroPitch + dy * k;
+    } else if (planet) {
+      lon = startLon - dx * k;                                           // drag sideways: spin
+      planetTilt = Math.max(0, Math.min(170, startPlanetTilt + dy * k)); // drag down: look higher
+    } else {
+      lon = startLon - dx * k;
+      lat = startLat + dy * k;
+    }
   }
+
+
 }
 
 function zoneForX(clientX) {
@@ -1097,26 +1265,8 @@ function setupPlaybackUI() {
 /* ---------- Top nav: mode / 180-360 / fullscreen / mute ---------- */
 
 function setupTopNav() {
-  const ZOOM_STEP = 8;
-  document.getElementById('zoomOutBtn').addEventListener('click', () => {
-    fov = Math.min(MAX_FOV, fov + ZOOM_STEP);
-    showZoomBadge();
-  });
-  document.getElementById('zoomInBtn').addEventListener('click', () => {
-    fov = Math.max(MIN_FOV, fov - ZOOM_STEP);
-    showZoomBadge();
-  });
-
   document.getElementById('projToggle').addEventListener('click', () => {
-    setProjectionMode(projectionMode === 'sphere' ? 'flat' : 'sphere');
-  });
-
-  document.getElementById('eyeToggle').addEventListener('click', () => {
-    stereoMode = stereoMode === 'full' ? 'left' : (stereoMode === 'left' ? 'right' : 'full');
-    applyStereoCrop();
-    const btn = document.getElementById('eyeToggle');
-    btn.textContent = stereoMode === 'full' ? '👁' : (stereoMode === 'left' ? 'L' : 'R');
-    btn.classList.toggle('active', stereoMode !== 'full');
+    setProjectionMode(projectionMode === 'sphere' ? 'planet' : 'sphere');
   });
 
   // Sensor ON/OFF
@@ -1142,7 +1292,7 @@ function setupTopNav() {
   document.getElementById('fovToggle').addEventListener('click', () => {
     is180 = !is180;
     document.getElementById('fovToggle').textContent = is180 ? '180' : '360';
-    buildSphere();
+    rebuildGeometry();
   });
 
   document.getElementById('fsToggle').addEventListener('click', async () => {
@@ -1160,25 +1310,34 @@ function setupTopNav() {
   });
 }
 
-function setProjectionMode(mode) {
-  const flat = mode === 'flat';
+function flashBadge(text) {
+  const badge = document.getElementById('zoomBadge');
+  badge.textContent = text;
+  badge.classList.add('show');
+  clearTimeout(seekBadgeTimer);
+  clearTimeout(zoomBadgeTimer);
+  zoomBadgeTimer = setTimeout(() => badge.classList.remove('show'), 1100);
+}
 
-  if (flat && projectionMode !== 'flat') {
-    preFlatFov = fov;
-    fov = 70; // a moderate FOV reads as "normal" video instead of fisheye-wide
+function setProjectionMode(mode) {
+  if (mode === 'planet' && projectionMode !== 'planet') {
+    prePlanetFov = fov;
+    lon = 0; planetTilt = 90; fov = 90;
+  } else if (mode !== 'planet' && projectionMode === 'planet') {
+    fov = prePlanetFov;
     lon = 0; lat = 0;
-  } else if (!flat && projectionMode === 'flat') {
-    fov = preFlatFov;
   }
   projectionMode = mode;
+  rebuildGeometry();
 
+  const icons = { sphere: '🌐', planet: '🪐' };
+  const names = { sphere: 'Sphere 360', planet: 'Tiny world' };
   const projBtn = document.getElementById('projToggle');
-  projBtn.textContent = flat ? '▭' : '🌐';
-  projBtn.classList.toggle('active', flat);
+  projBtn.textContent = icons[mode];
+  projBtn.title = names[mode];
+  projBtn.classList.toggle('active', mode !== 'sphere');
+  flashBadge(names[mode]);
 
-  // gyro/touch look mode only makes sense in free-look sphere mode
-  document.getElementById('modeToggle').style.display = flat ? 'none' : 'flex';
-  document.getElementById('touchToggle').style.display = flat ? 'none' : 'flex';
 }
 
 /* ---------- Playlist ---------- */
@@ -1226,6 +1385,7 @@ function loadIndex(idx) {
   document.getElementById('nextBtn').disabled = idx === files.length - 1;
   // reset view/zoom for the new video
   lon = 0; lat = 0; gyroYaw = 0; gyroPitch = 0; fov = baseFov;
+  lastErr = ''; dbgFrames = 0; diagUntil = Date.now() + 8000;
   if (typeof showControls === 'function') showControls();
 }
 
